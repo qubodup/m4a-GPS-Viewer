@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>M4A GPS Metadata Extractor + OSM Map</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; }
+  #dropzone {
+    border: 3px dashed #888; padding: 40px; text-align: center; margin: 20px 0;
+    background: #fff; border-radius: 10px; cursor: pointer;
+  }
+  #dropzone.dragover { background: #e0f0ff; border-color: #00f; }
+  table { border-collapse: collapse; width: 100%; margin: 15px 0; }
+  th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+  th { background: #eee; }
+  .map-container { height: 650px; margin: 20px 0; border: 1px solid #ccc; border-radius: 8px; }
+  .warning { color: red; font-weight: bold; }
+  button { padding: 10px 16px; font-size: 16px; margin: 10px 5px; }
+</style>
+</head>
+<body>
+<h1>M4A GPS Metadata Extractor + OpenStreetMap</h1>
+
+<div id="dropzone">Drop M4A file here or click to select</div>
+<input type="file" id="fileInput" accept=".m4a" style="display:none;">
+
+<div id="map" class="map-container"></div>
+<div id="status"></div>
+
+<div id="filenameData"></div>
+<div id="metadataData"></div>
+<div id="combinedData"></div>
+
+<div id="actions" style="display:none; margin:20px 0;">
+  <button onclick="exportGPX()">📤 Export as GPX</button>
+</div>
+
+<script>
+// =============== Leaflet Map ===============
+let map, markers = [], polyline, currentPoints = [];
+
+function initMap() {
+  map = L.map('map').setView([52.52, 13.405], 12);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    attribution: '&copy; OpenStreetMap contributors'
+  }).addTo(map);
+}
+initMap();
+
+// =============== Helpers ===============
+function formatUnixTime(ts) {
+  if (!ts) return '—';
+  const date = new Date(ts * 1000);
+  return date.toLocaleString('de-DE', { timeZone: 'Europe/Berlin' });
+}
+
+function degToColor(progress) {
+  const r = Math.floor(255 * (1 - progress));
+  return `#${r.toString(16).padStart(2,'0')}0000`;
+}
+
+// =============== Parsing ===============
+function parseFilename(filename) {
+  const regex = /Recording_(\d{8})_(\d{6})_GPS_([\d.]+)_([\d.]+)\.m4a$/;
+  const match = filename.match(regex);
+  if (!match) return null;
+
+  const [_, dateStr, timeStr, lat, lon] = match;
+  const datetime = `${dateStr.slice(0,4)}-${dateStr.slice(4,6)}-${dateStr.slice(6,8)}T${timeStr.slice(0,2)}:${timeStr.slice(2,4)}:${timeStr.slice(4,6)}`;
+  const timestamp = Math.floor(new Date(datetime).getTime() / 1000);
+
+  return { type: 'filename', lat: parseFloat(lat), lon: parseFloat(lon), timestamp };
+}
+
+function extractMetadataGPS(text) {
+  const results = [];
+  const jsonRegex = /\{[^{}]*"v":1,[^{}]*"start"\s*:\s*\[[\d.]+,\s*[\d.]+\][^{}]*"path"\s*:\s*\[.*?\]\}/g;
+  let match;
+
+  while ((match = jsonRegex.exec(text)) !== null) {
+    try {
+      const obj = JSON.parse(match[0]);
+      if (!obj.start || !obj.path) continue;
+
+      // Start point
+      results.push({
+        lat: obj.start[0], lon: obj.start[1],
+        timestamp: obj.path[0]?.[2] || null,
+        speed: obj.path[0]?.[3] || null
+      });
+
+      obj.path.forEach(p => {
+        results.push({
+          lat: p[0], lon: p[1],
+          timestamp: p[2], speed: p[3]
+        });
+      });
+    } catch(e) {}
+  }
+  return results;
+}
+
+// =============== GPX Export ===============
+function exportGPX() {
+  if (currentPoints.length === 0) return;
+
+  let gpx = `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="M4A GPS Extractor">
+  <trk>
+    <name>Recording GPS Track</name>
+    <trkseg>`;
+
+  currentPoints.forEach(p => {
+    if (p.timestamp) {
+      const timeStr = new Date(p.timestamp * 1000).toISOString();
+      gpx += `\n      <trkpt lat="${p.lat}" lon="${p.lon}">
+        <time>${timeStr}</time>
+      </trkpt>`;
+    }
+  });
+
+  gpx += `\n    </trkseg>
+  </trk>
+</gpx>`;
+
+  const blob = new Blob([gpx], { type: 'application/gpx+xml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'recording_gps_track.gpx';
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+// =============== Main Processing ===============
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+
+dropzone.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', e => e.target.files[0] && processFile(e.target.files[0]));
+
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dragover'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) processFile(e.dataTransfer.files[0]);
+});
+
+async function processFile(file) {
+  if (!file) return;
+
+  // Size warning
+  if (file.size > 5 * 1024 * 1024) {
+    if (!confirm(`Warning, file size is ${(file.size/1024/1024).toFixed(1)} MB.\nThis tool was not tested with files >1MB. Page might freeze.\nContinue?`)) return;
+  }
+
+  document.getElementById('status').innerHTML = `<p>Processing <strong>${file.name}</strong> (${(file.size/1024/1024).toFixed(2)} MB)...</p>`;
+
+  // Clear old data
+  markers.forEach(m => m.remove());
+  if (polyline) polyline.remove();
+  markers = [];
+  currentPoints = [];
+
+  const text = await file.text();
+
+  const filenameData = parseFilename(file.name);
+  const metaPoints = extractMetadataGPS(text);
+
+  let html = '';
+
+  // === Filename Table ===
+  html += '<h2>📍 Filename GPS</h2>';
+  if (filenameData) {
+    html += `<table><tr><th>Latitude</th><th>Longitude</th><th>Time (Berlin)</th></tr>`;
+    html += `<tr><td>${filenameData.lat}</td><td>${filenameData.lon}</td><td>${formatUnixTime(filenameData.timestamp)}</td></tr></table>`;
+  } else {
+    html += '<p style="color:orange;">Could not parse GPS from filename.</p>';
+  }
+  document.getElementById('filenameData').innerHTML = html;
+
+  // === Metadata Table ===
+  html = '<h2>📍 Metadata rGPS Points</h2>';
+  if (metaPoints.length > 0) {
+    html += `<table><tr><th>#</th><th>Latitude</th><th>Longitude</th><th>Time (Berlin)</th><th>Speed (km/h)</th></tr>`;
+    metaPoints.forEach((p,i) => {
+      html += `<tr><td>${i+1}</td><td>${p.lat}</td><td>${p.lon}</td><td>${formatUnixTime(p.timestamp)}</td><td>${p.speed||'—'}</td></tr>`;
+    });
+    html += `</table><p><strong>${metaPoints.length} points extracted.</strong></p>`;
+  } else {
+    html += '<p style="color:orange;">No rGPS metadata found.</p>';
+  }
+  document.getElementById('metadataData').innerHTML = html;
+
+  // === Plot on Map ===
+  const bounds = L.latLngBounds([]);
+
+  // Green - Filename
+  if (filenameData) {
+    const m = L.marker([filenameData.lat, filenameData.lon], {
+      icon: L.divIcon({className: '', html: '🟢', iconSize: [32,32]})
+    }).addTo(map).bindPopup(`<b>Filename Start</b><br>${formatUnixTime(filenameData.timestamp)}`);
+    markers.push(m);
+    currentPoints.push(filenameData);
+    bounds.extend([filenameData.lat, filenameData.lon]);
+  }
+
+  // Red gradient - Metadata
+  if (metaPoints.length > 0) {
+    const times = metaPoints.map(p => p.timestamp).filter(Boolean);
+    const minT = Math.min(...times);
+    const maxT = Math.max(...times);
+
+    metaPoints.forEach((p, i) => {
+      let color = '#ff0000';
+      if (minT !== maxT && p.timestamp) {
+        color = degToColor((p.timestamp - minT) / (maxT - minT));
+      }
+
+      const m = L.circleMarker([p.lat, p.lon], {
+        radius: 6, fillColor: color, color: '#000', weight: 1, fillOpacity: 0.9
+      }).addTo(map).bindPopup(`<b>Point ${i+1}</b><br>Time: ${formatUnixTime(p.timestamp)}<br>Speed: ${p.speed||'—'}`);
+      markers.push(m);
+      currentPoints.push(p);
+      bounds.extend([p.lat, p.lon]);
+    });
+
+    if (currentPoints.length > 1) {
+      polyline = L.polyline(currentPoints.map(p => [p.lat, p.lon]), {color: '#880000', weight: 5, opacity: 0.75}).addTo(map);
+    }
+  }
+
+  if (bounds.isValid()) {
+    map.fitBounds(bounds, { padding: [60, 60] });
+  }
+
+  document.getElementById('actions').style.display = 'block';
+  document.getElementById('status').innerHTML += '<p style="color:green;">✅ Processing complete!</p>';
+}
+</script>
+</body>
+</html>
